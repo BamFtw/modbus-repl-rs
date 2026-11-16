@@ -1,0 +1,20 @@
+[package]
+name = "modbus-repl"
+version = "0.3.0"
+edition = "2021"
+rust-version = "1.82"
+description = "Interactive / headless Modbus client supporting TCP, UDP and RTU"
+authors = ["Michal Molawka"]
+license = "MIT"
+repository = "https://github.com/bam-ftw/modbus-repl-rs"
+
+# Intentionally no dependencies: everything (CLI parsing, Modbus framing,
+# serial port access) is implemented on top of the Rust standard library.
+[dependencies]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
