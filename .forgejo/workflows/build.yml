@@ -1,0 +1,97 @@
+# Builds fully static, standalone modbus-repl executables for Linux and Windows.
+#
+# Both binaries are produced on a Linux runner:
+#   - Linux:   x86_64-unknown-linux-musl  (statically linked, runs on any distro)
+#   - Windows: x86_64-pc-windows-gnu      (cross-compiled with mingw-w64, static CRT)
+#
+# Requires a Forgejo runner offering the `docker` label (the default for
+# forgejo-runner). Adjust `runs-on` if your runner uses different labels.
+
+name: build
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTUP_HOME: /usr/local/rustup
+  CARGO_HOME: /usr/local/cargo
+
+jobs:
+  test:
+    runs-on: docker
+    container:
+      # node is needed by the checkout / artifact actions
+      image: node:20-bookworm
+    steps:
+      - uses: https://code.forgejo.org/actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --component clippy
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test
+
+  build:
+    needs: test
+    runs-on: docker
+    container:
+      image: node:20-bookworm
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            target: x86_64-unknown-linux-musl
+            packages: musl-tools
+            binary: modbus-repl
+            artifact: modbus-repl-linux-x86_64
+          - name: windows-x86_64
+            target: x86_64-pc-windows-gnu
+            packages: gcc-mingw-w64-x86-64
+            binary: modbus-repl.exe
+            artifact: modbus-repl-windows-x86_64.exe
+    steps:
+      - uses: https://code.forgejo.org/actions/checkout@v4
+
+      - name: Install system packages
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ${{ matrix.packages }}
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --target ${{ matrix.target }}
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Build
+        env:
+          CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Inspect binary
+        run: |
+          BIN=target/${{ matrix.target }}/release/${{ matrix.binary }}
+          ls -l "$BIN"
+          file "$BIN" || true
+          mkdir -p dist
+          cp "$BIN" "dist/${{ matrix.artifact }}"
+          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-musl" ]; then
+            dist/${{ matrix.artifact }} --version
+          fi
+
+      - uses: https://code.forgejo.org/actions/upload-artifact@v3
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}

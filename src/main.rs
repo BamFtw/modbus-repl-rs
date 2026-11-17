@@ -1,11 +1,13 @@
 mod cli;
 mod commands;
+mod format;
 mod modbus;
 mod serial;
 mod transport;
 
 use cli::{Action, Config, Proto};
 use commands::Command;
+use format::{Failure, Format, OutFmt};
 use modbus::{Client, Transport};
 use std::io::{self, BufRead, Write};
 use std::process::ExitCode;
@@ -38,34 +40,94 @@ fn open_transport(cfg: &Config) -> modbus::Result<(Box<dyn Transport>, String)> 
 }
 
 fn report(e: &modbus::Error) {
-    match e {
-        // Usage errors already carry their "ERROR:" prefix.
-        modbus::Error::Usage(_) => eprintln!("{e}"),
-        _ => eprintln!("ERROR: {e}"),
+    eprintln!("ERROR: {e}");
+}
+
+enum Outcome {
+    Ok,
+    Failed,
+    Exit,
+}
+
+/// State shared by the headless and interactive front ends.
+struct Session {
+    client: Client,
+    fmt: Format,
+    /// Emit document separators (yml `---`) between outputs (headless only).
+    separate: bool,
+    printed: usize,
+}
+
+impl Session {
+    fn emit(&mut self, doc: &str) {
+        if doc.is_empty() {
+            return;
+        }
+        if self.separate && self.printed > 0 {
+            print!("{}", self.fmt.separator());
+        }
+        self.printed += 1;
+        print!("{doc}");
+    }
+
+    fn fail(&mut self, f: &Failure) {
+        match self.fmt.failure(f) {
+            Some(doc) => self.emit(&doc),
+            None => report(f.error),
+        }
+    }
+
+    fn run(&mut self, line: &str) -> Outcome {
+        let cmd = match commands::parse(line) {
+            Ok(cmd) => cmd,
+            Err(e) => {
+                let command = line.split_whitespace().next().unwrap_or_default();
+                self.fail(&Failure { command, addr: None, count: None, error: &e });
+                return Outcome::Failed;
+            }
+        };
+        match cmd {
+            Command::Exit => return Outcome::Exit,
+            Command::Help => {
+                let help = cli::USAGE.split("COMMANDS:").nth(1).unwrap_or("");
+                let help = help.split("EXAMPLES:").next().unwrap_or("");
+                println!("COMMANDS:{}", help.trim_end());
+            }
+            Command::Fmt(Some(f)) => self.fmt.out = f,
+            Command::Fmt(None) => println!("fmt: {}", self.fmt.out.name()),
+            _ => match commands::execute(&mut self.client, &cmd) {
+                Ok(resp) => {
+                    let doc = self.fmt.response(&resp);
+                    self.emit(&doc);
+                }
+                Err(e) => {
+                    self.fail(&Failure { command: cmd.name(), addr: cmd.addr(), count: cmd.count(), error: &e });
+                    return Outcome::Failed;
+                }
+            },
+        }
+        Outcome::Ok
     }
 }
 
-fn headless(client: &mut Client, command: &str) -> ExitCode {
+fn commands_in(line: &str) -> impl Iterator<Item = &str> {
+    line.split(';').map(str::trim).filter(|l| !l.is_empty())
+}
+
+fn headless(session: &mut Session, command: &str) -> ExitCode {
     let mut code = ExitCode::SUCCESS;
-    for line in command.split(';').map(str::trim).filter(|l| !l.is_empty()) {
-        let result = commands::parse(line).and_then(|cmd| commands::execute(client, &cmd));
-        match result {
-            Ok(out) => {
-                if let Some(json) = out.json() {
-                    println!("{json}");
-                }
-            }
-            Err(e) => {
-                report(&e);
-                code = ExitCode::FAILURE;
-            }
+    for line in commands_in(command) {
+        match session.run(line) {
+            Outcome::Ok => {}
+            Outcome::Failed => code = ExitCode::FAILURE,
+            Outcome::Exit => break,
         }
     }
     code
 }
 
-fn interactive(client: &mut Client, prompt: &str) -> ExitCode {
-    println!("Connection established (unit {}). Type 'help' for commands.", client.unit);
+fn interactive(session: &mut Session, prompt: &str) -> ExitCode {
+    println!("Connection established (unit {}). Type 'help' for commands.", session.client.unit);
     let stdin = io::stdin();
     let mut line = String::new();
     loop {
@@ -83,19 +145,9 @@ fn interactive(client: &mut Client, prompt: &str) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         }
-        for cmd_line in line.split(';').map(str::trim).filter(|l| !l.is_empty()) {
-            match commands::parse(cmd_line) {
-                Ok(Command::Exit) => return ExitCode::SUCCESS,
-                Ok(Command::Help) => {
-                    let help = cli::USAGE.split("COMMANDS:").nth(1).unwrap_or("");
-                    let help = help.split("EXAMPLES:").next().unwrap_or("");
-                    println!("COMMANDS:{}", help.trim_end());
-                }
-                Ok(cmd) => match commands::execute(client, &cmd) {
-                    Ok(out) => print!("{}", out.pretty()),
-                    Err(e) => report(&e),
-                },
-                Err(e) => report(&e),
+        for cmd_line in commands_in(&line) {
+            if let Outcome::Exit = session.run(cmd_line) {
+                return ExitCode::SUCCESS;
             }
         }
     }
@@ -126,10 +178,17 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let mut client = Client::new(transport, cfg.unit);
+    let headless_mode = cfg.command.is_some();
+    let default_fmt = if headless_mode { OutFmt::Json } else { OutFmt::Columns };
+    let mut session = Session {
+        client: Client::new(transport, cfg.unit),
+        fmt: Format { out: cfg.fmt.unwrap_or(default_fmt), endian: cfg.endian, number: cfg.number, coil: cfg.coil },
+        separate: headless_mode,
+        printed: 0,
+    };
 
     match cfg.command.as_deref() {
-        Some(cmd) => headless(&mut client, cmd),
-        _ => interactive(&mut client, &prompt),
+        Some(cmd) => headless(&mut session, cmd),
+        _ => interactive(&mut session, &prompt),
     }
 }

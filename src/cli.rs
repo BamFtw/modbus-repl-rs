@@ -1,5 +1,6 @@
 //! Minimal command line argument parser (no external crates).
 
+use crate::format::{CoilFmt, Endian, NumFmt, OutFmt};
 use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +31,11 @@ pub struct Config {
     pub parity: Parity,
     pub data_bits: u8,
     pub stop_bits: u8,
+    // Output formatting; `fmt` defaults to columns (interactive) or json (headless).
+    pub fmt: Option<OutFmt>,
+    pub endian: Endian,
+    pub number: NumFmt,
+    pub coil: CoilFmt,
 }
 
 impl Default for Config {
@@ -46,6 +52,10 @@ impl Default for Config {
             parity: Parity::None,
             data_bits: 8,
             stop_bits: 1,
+            fmt: None,
+            endian: Endian::Big,
+            number: NumFmt::Dec,
+            coil: CoilFmt::Bool,
         }
     }
 }
@@ -66,9 +76,15 @@ GENERAL OPTIONS:
     -P, --proto <tcp|udp|rtu>   Protocol to use                         [default: tcp]
     -u, --unit <ID>             Modbus unit / slave id (0-255)          [default: 1]
     -t, --timeout <MS>          Response timeout in milliseconds        [default: 1500]
-    -c, --command <CMD>         Run command(s) (separated by ;), print JSON and exit
+    -c, --command <CMD>         Run command(s) (separated by ;), print the results and exit
         --help                  Print this help
     -V, --version               Print version
+
+OUTPUT OPTIONS:
+    -f, --fmt <FORMAT>          json, yml, columns or list   [default: columns, json with --command]
+    -e, --endian <big|little>   Byte order of 16-bit registers          [default: big]
+    -n, --number-fmt <FMT>      dec, signed, hex, oct or bin            [default: dec]
+        --coil-fmt <bool|int>   Coil / discrete input values            [default: bool]
 
 TCP / UDP OPTIONS:
     -h, --host <HOST>           Address of the Modbus server            [default: localhost]
@@ -88,6 +104,7 @@ COMMANDS:
     rh A N          read N holding registers starting at address A
     wc A C1 .. Cn   write coils (1 or 0) starting at address A
     wh A R1 .. Rn   write 16-bit holding registers starting at address A
+    fmt [FORMAT]    switch output format (json, yml, columns, list), or show it
     help            show command help (interactive mode)
     exit | quit     leave interactive mode
 
@@ -171,6 +188,25 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Action, String> 
                 }
                 cfg.command = Some(cmd);
             }
+            "--fmt" | "-f" => {
+                let v = value(&name)?;
+                cfg.fmt = Some(
+                    OutFmt::parse(&v).ok_or_else(|| format!("unknown format '{v}', use {}", OutFmt::NAMES))?,
+                );
+            }
+            "--endian" | "-e" => {
+                let v = value(&name)?;
+                cfg.endian = Endian::parse(&v).ok_or_else(|| format!("invalid endian '{v}', use big or little"))?;
+            }
+            "--number-fmt" | "-n" => {
+                let v = value(&name)?;
+                cfg.number = NumFmt::parse(&v)
+                    .ok_or_else(|| format!("invalid number format '{v}', use dec, signed, hex, oct or bin"))?;
+            }
+            "--coil-fmt" => {
+                let v = value(&name)?;
+                cfg.coil = CoilFmt::parse(&v).ok_or_else(|| format!("invalid coil format '{v}', use bool or int"))?;
+            }
             "--device" | "-d" => cfg.device = Some(value(&name)?),
             "--baud" | "-b" => cfg.baud = num(&name, &value(&name)?)?,
             "--parity" => {
@@ -232,6 +268,21 @@ mod tests {
         assert_eq!(c.port, 5020);
         assert_eq!(c.proto, Proto::Udp);
         assert_eq!(c.command.as_deref(), Some("rh 0 1"));
+    }
+
+    #[test]
+    fn format_options() {
+        let Ok(Action::Run(c)) = p(&[]) else { panic!() };
+        assert_eq!((c.fmt, c.endian, c.number, c.coil), (None, Endian::Big, NumFmt::Dec, CoilFmt::Bool));
+        let Ok(Action::Run(c)) = p(&["-f", "yml", "-e", "little", "-n", "hex", "--coil-fmt=int"]) else { panic!() };
+        assert_eq!(
+            (c.fmt, c.endian, c.number, c.coil),
+            (Some(OutFmt::Yml), Endian::Little, NumFmt::Hex, CoilFmt::Int)
+        );
+        assert!(p(&["-f", "xml"]).is_err());
+        assert!(p(&["-e", "middle"]).is_err());
+        assert!(p(&["-n", "dez"]).is_err());
+        assert!(p(&["--coil-fmt", "yes"]).is_err());
     }
 
     #[test]

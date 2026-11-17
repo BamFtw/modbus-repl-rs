@@ -1,6 +1,7 @@
 //! REPL command parsing, execution and output formatting.
 
 use crate::cli::parse_uint;
+use crate::format::{OutFmt, Response, Values};
 use crate::modbus::{self, Client, Error, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,18 +17,49 @@ pub enum Command {
     Read { table: Table, addr: u16, count: u16 },
     WriteCoils { addr: u16, values: Vec<bool> },
     WriteRegisters { addr: u16, values: Vec<u16> },
+    /// Switch the output format; `None` shows the current one.
+    Fmt(Option<OutFmt>),
     Help,
     Exit,
 }
 
-pub enum Output {
-    None,
-    Bits { addr: u16, values: Vec<bool> },
-    Registers { addr: u16, values: Vec<u16> },
+impl Command {
+    /// Short command name as typed by the user (`rh`, `wc`, ...).
+    pub fn name(&self) -> &'static str {
+        match self {
+            Command::Read { table: Table::Coils, .. } => "rc",
+            Command::Read { table: Table::Discrete, .. } => "rd",
+            Command::Read { table: Table::Input, .. } => "ri",
+            Command::Read { table: Table::Holding, .. } => "rh",
+            Command::WriteCoils { .. } => "wc",
+            Command::WriteRegisters { .. } => "wh",
+            Command::Fmt(_) => "fmt",
+            Command::Help => "help",
+            Command::Exit => "exit",
+        }
+    }
+
+    pub fn addr(&self) -> Option<u16> {
+        match *self {
+            Command::Read { addr, .. } | Command::WriteCoils { addr, .. } | Command::WriteRegisters { addr, .. } => {
+                Some(addr)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn count(&self) -> Option<u16> {
+        match self {
+            Command::Read { count, .. } => Some(*count),
+            Command::WriteCoils { values, .. } => Some(values.len() as u16),
+            Command::WriteRegisters { values, .. } => Some(values.len() as u16),
+            _ => None,
+        }
+    }
 }
 
 fn usage(msg: impl Into<String>) -> Error {
-    Error::Usage(format!("ERROR: {}", msg.into()))
+    Error::Usage(msg.into())
 }
 
 fn parse_addr(s: Option<&&str>) -> Result<u16> {
@@ -58,6 +90,15 @@ pub fn parse(line: &str) -> Result<Command> {
     match cmd.as_str() {
         "help" | "?" => return Ok(Command::Help),
         "exit" | "quit" => return Ok(Command::Exit),
+        "fmt" => {
+            return match parts.get(1..).unwrap_or(&[]) {
+                [] => Ok(Command::Fmt(None)),
+                [f] => OutFmt::parse(f)
+                    .map(|f| Command::Fmt(Some(f)))
+                    .ok_or_else(|| usage(format!("unknown format '{f}', use {}", OutFmt::NAMES))),
+                _ => Err(usage("too many arguments, expected: fmt <format>")),
+            };
+        }
         _ => {}
     }
 
@@ -107,75 +148,35 @@ pub fn parse(line: &str) -> Result<Command> {
     }
 }
 
-pub fn execute(client: &mut Client, cmd: &Command) -> Result<Output> {
-    Ok(match *cmd {
-        Command::Read { table, addr, count } => match table {
-            Table::Coils => Output::Bits { addr, values: client.read_bits(modbus::FC_READ_COILS, addr, count)? },
-            Table::Discrete => {
-                Output::Bits { addr, values: client.read_bits(modbus::FC_READ_DISCRETE_INPUTS, addr, count)? }
-            }
-            Table::Input => Output::Registers {
-                addr,
-                values: client.read_registers(modbus::FC_READ_INPUT_REGISTERS, addr, count)?,
-            },
-            Table::Holding => Output::Registers {
-                addr,
-                values: client.read_registers(modbus::FC_READ_HOLDING_REGISTERS, addr, count)?,
-            },
-        },
+/// Run a read or write command against the device.
+/// Must not be called with `Fmt`, `Help` or `Exit`.
+pub fn execute(client: &mut Client, cmd: &Command) -> Result<Response> {
+    let command = cmd.name();
+    let (addr, values, write) = match *cmd {
+        Command::Read { table, addr, count } => {
+            let values = match table {
+                Table::Coils => Values::Bits(client.read_bits(modbus::FC_READ_COILS, addr, count)?),
+                Table::Discrete => Values::Bits(client.read_bits(modbus::FC_READ_DISCRETE_INPUTS, addr, count)?),
+                Table::Input => Values::Registers(client.read_registers(modbus::FC_READ_INPUT_REGISTERS, addr, count)?),
+                Table::Holding => {
+                    Values::Registers(client.read_registers(modbus::FC_READ_HOLDING_REGISTERS, addr, count)?)
+                }
+            };
+            (addr, values, false)
+        }
         Command::WriteCoils { addr, ref values } => {
             client.write_coils(addr, values)?;
-            Output::None
+            (addr, Values::Bits(values.clone()), true)
         }
         Command::WriteRegisters { addr, ref values } => {
             client.write_registers(addr, values)?;
-            Output::None
+            (addr, Values::Registers(values.clone()), true)
         }
-        Command::Help | Command::Exit => Output::None,
-    })
-}
-
-fn printable(b: u8) -> char {
-    if (33..=126).contains(&b) {
-        b as char
-    } else {
-        '.'
-    }
-}
-
-impl Output {
-    pub fn pretty(&self) -> String {
-        let mut out = String::new();
-        match self {
-            Output::None => {}
-            Output::Bits { addr, values } => {
-                for (i, v) in values.iter().enumerate() {
-                    let a = *addr as usize + i;
-                    out += &format!("  {a:05} : {:>5}\n", *v as u8);
-                }
-            }
-            Output::Registers { addr, values } => {
-                for (i, v) in values.iter().enumerate() {
-                    let a = *addr as usize + i;
-                    let [hi, lo] = v.to_be_bytes();
-                    out += &format!("  {a:05} : {v:>5} | 0x{v:04X} | {}{}\n", printable(hi), printable(lo));
-                }
-            }
+        Command::Fmt(_) | Command::Help | Command::Exit => {
+            return Err(usage(format!("'{command}' is not a device command")));
         }
-        out
-    }
-
-    pub fn json(&self) -> Option<String> {
-        match self {
-            Output::None => None,
-            Output::Bits { values, .. } => {
-                Some(format!("[{}]", values.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",")))
-            }
-            Output::Registers { values, .. } => {
-                Some(format!("[{}]", values.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",")))
-            }
-        }
-    }
+    };
+    Ok(Response { command, addr, values, write })
 }
 
 #[cfg(test)]
@@ -205,12 +206,18 @@ mod tests {
     }
 
     #[test]
-    fn formatting() {
-        let o = Output::Registers { addr: 7, values: vec![0x4142, 5] };
-        assert_eq!(o.pretty(), "  00007 : 16706 | 0x4142 | AB\n  00008 :     5 | 0x0005 | ..\n");
-        assert_eq!(o.json().unwrap(), "[16706,5]");
-        let b = Output::Bits { addr: 0, values: vec![true, false] };
-        assert_eq!(b.pretty(), "  00000 :     1\n  00001 :     0\n");
-        assert_eq!(b.json().unwrap(), "[true,false]");
+    fn parse_fmt() {
+        assert_eq!(parse("fmt json").unwrap(), Command::Fmt(Some(OutFmt::Json)));
+        assert_eq!(parse("FMT yaml").unwrap(), Command::Fmt(Some(OutFmt::Yml)));
+        assert_eq!(parse("fmt").unwrap(), Command::Fmt(None));
+        assert!(parse("fmt xml").is_err());
+        assert!(parse("fmt json list").is_err());
+    }
+
+    #[test]
+    fn names() {
+        assert_eq!(parse("ri 5 2").unwrap().name(), "ri");
+        let w = parse("wc 3 1 0").unwrap();
+        assert_eq!((w.name(), w.addr(), w.count()), ("wc", Some(3), Some(2)));
     }
 }
