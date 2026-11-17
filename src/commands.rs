@@ -19,6 +19,8 @@ pub enum Command {
     WriteRegisters { addr: u16, values: Vec<u16> },
     /// Switch the output format; `None` shows the current one.
     Fmt(Option<OutFmt>),
+    /// Pause for the given number of milliseconds.
+    Wait(u64),
     Help,
     Exit,
 }
@@ -34,6 +36,7 @@ impl Command {
             Command::WriteCoils { .. } => "wc",
             Command::WriteRegisters { .. } => "wh",
             Command::Fmt(_) => "fmt",
+            Command::Wait(_) => "wait",
             Command::Help => "help",
             Command::Exit => "exit",
         }
@@ -99,6 +102,15 @@ pub fn parse(line: &str) -> Result<Command> {
                 _ => Err(usage("too many arguments, expected: fmt <format>")),
             };
         }
+        "wait" => {
+            return match parts.get(1..).unwrap_or(&[]) {
+                [ms] => parse_uint(ms)
+                    .map(Command::Wait)
+                    .ok_or_else(|| usage(format!("invalid number of milliseconds '{ms}'"))),
+                [] => Err(usage("missing time, expected: wait <milliseconds>")),
+                _ => Err(usage("too many arguments, expected: wait <milliseconds>")),
+            };
+        }
         _ => {}
     }
 
@@ -149,7 +161,7 @@ pub fn parse(line: &str) -> Result<Command> {
 }
 
 /// Run a read or write command against the device.
-/// Must not be called with `Fmt`, `Help` or `Exit`.
+/// Must not be called with `Fmt`, `Wait`, `Help` or `Exit`.
 pub fn execute(client: &mut Client, cmd: &Command) -> Result<Response> {
     let command = cmd.name();
     let (addr, values, write) = match *cmd {
@@ -172,7 +184,7 @@ pub fn execute(client: &mut Client, cmd: &Command) -> Result<Response> {
             client.write_registers(addr, values)?;
             (addr, Values::Registers(values.clone()), true)
         }
-        Command::Fmt(_) | Command::Help | Command::Exit => {
+        Command::Fmt(_) | Command::Wait(_) | Command::Help | Command::Exit => {
             return Err(usage(format!("'{command}' is not a device command")));
         }
     };
@@ -212,6 +224,16 @@ mod tests {
         assert_eq!(parse("fmt").unwrap(), Command::Fmt(None));
         assert!(parse("fmt xml").is_err());
         assert!(parse("fmt json list").is_err());
+    }
+
+    #[test]
+    fn parse_wait() {
+        assert_eq!(parse("wait 250").unwrap(), Command::Wait(250));
+        assert_eq!(parse("WAIT 0x10").unwrap(), Command::Wait(16));
+        assert!(parse("wait").is_err());
+        assert!(parse("wait -5").is_err());
+        assert!(parse("wait 1s").is_err());
+        assert!(parse("wait 1 2").is_err());
     }
 
     #[test]

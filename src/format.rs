@@ -179,6 +179,8 @@ pub struct Failure<'a> {
     pub command: &'a str,
     pub addr: Option<u16>,
     pub count: Option<u16>,
+    /// Script line the command came from.
+    pub line: Option<usize>,
     pub error: &'a Error,
 }
 
@@ -365,6 +367,9 @@ impl Format {
         if let Some(c) = f.count {
             fields.push(("count", Field::Int(c as i64)));
         }
+        if let Some(l) = f.line {
+            fields.push(("line", Field::Int(l as i64)));
+        }
         fields.push(("error", Field::Str(f.error.to_string())));
         Some(self.document(&fields))
     }
@@ -441,13 +446,16 @@ mod tests {
     #[test]
     fn failures() {
         let e = Error::Exception { function: 4, code: 2 };
-        let f = Failure { command: "ri", addr: Some(1), count: Some(2), error: &e };
+        let f = Failure { command: "ri", addr: Some(1), count: Some(2), line: None, error: &e };
         let s = fmt(OutFmt::Json).failure(&f).unwrap();
         assert!(s.starts_with("{\n\t\"error_code\": 2,"));
         assert!(s.contains("\"error\": \"modbus exception 0x02"));
         assert!(fmt(OutFmt::Columns).failure(&f).is_none());
         let e = Error::Usage("bad \"x\"".into());
-        let f = Failure { command: "1x", addr: None, count: None, error: &e };
-        assert_eq!(fmt(OutFmt::Yml).failure(&f).unwrap(), "error_code: -4\ncommand: \"1x\"\nerror: \"bad \\\"x\\\"\"\n");
+        let f = Failure { command: "1x", addr: None, count: None, line: Some(3), error: &e };
+        assert_eq!(
+            fmt(OutFmt::Yml).failure(&f).unwrap(),
+            "error_code: -4\ncommand: \"1x\"\nline: 3\nerror: \"bad \\\"x\\\"\"\n"
+        );
     }
 }

@@ -1,7 +1,9 @@
 mod cli;
 mod commands;
+mod config;
 mod format;
 mod modbus;
+mod script;
 mod serial;
 mod transport;
 
@@ -11,6 +13,7 @@ use format::{Failure, Format, OutFmt};
 use modbus::{Client, Transport};
 use std::io::{self, BufRead, Write};
 use std::process::ExitCode;
+use std::time::Duration;
 
 fn open_transport(cfg: &Config) -> modbus::Result<(Box<dyn Transport>, String)> {
     Ok(match cfg.proto {
@@ -56,6 +59,8 @@ struct Session {
     /// Emit document separators (yml `---`) between outputs (headless only).
     separate: bool,
     printed: usize,
+    /// Script line of the command being run, reported with errors.
+    line: Option<usize>,
 }
 
 impl Session {
@@ -73,7 +78,10 @@ impl Session {
     fn fail(&mut self, f: &Failure) {
         match self.fmt.failure(f) {
             Some(doc) => self.emit(&doc),
-            None => report(f.error),
+            None => match f.line {
+                Some(l) => eprintln!("ERROR: line {l}: {}", f.error),
+                None => report(f.error),
+            },
         }
     }
 
@@ -82,7 +90,7 @@ impl Session {
             Ok(cmd) => cmd,
             Err(e) => {
                 let command = line.split_whitespace().next().unwrap_or_default();
-                self.fail(&Failure { command, addr: None, count: None, error: &e });
+                self.fail(&Failure { command, addr: None, count: None, line: self.line, error: &e });
                 return Outcome::Failed;
             }
         };
@@ -90,18 +98,28 @@ impl Session {
             Command::Exit => return Outcome::Exit,
             Command::Help => {
                 let help = cli::USAGE.split("COMMANDS:").nth(1).unwrap_or("");
-                let help = help.split("EXAMPLES:").next().unwrap_or("");
+                let help = help.split("SCRIPTS:").next().unwrap_or("");
                 println!("COMMANDS:{}", help.trim_end());
             }
             Command::Fmt(Some(f)) => self.fmt.out = f,
             Command::Fmt(None) => println!("fmt: {}", self.fmt.out.name()),
+            Command::Wait(ms) => {
+                let _ = io::stdout().flush();
+                std::thread::sleep(Duration::from_millis(ms));
+            }
             _ => match commands::execute(&mut self.client, &cmd) {
                 Ok(resp) => {
                     let doc = self.fmt.response(&resp);
                     self.emit(&doc);
                 }
                 Err(e) => {
-                    self.fail(&Failure { command: cmd.name(), addr: cmd.addr(), count: cmd.count(), error: &e });
+                    self.fail(&Failure {
+                        command: cmd.name(),
+                        addr: cmd.addr(),
+                        count: cmd.count(),
+                        line: self.line,
+                        error: &e,
+                    });
                     return Outcome::Failed;
                 }
             },
@@ -114,10 +132,17 @@ fn commands_in(line: &str) -> impl Iterator<Item = &str> {
     line.split(';').map(str::trim).filter(|l| !l.is_empty())
 }
 
-fn headless(session: &mut Session, command: &str) -> ExitCode {
+/// Run commands without a prompt: `--command` (no line numbers) or `--script`.
+fn headless(session: &mut Session, steps: &[(Option<usize>, String)]) -> ExitCode {
     let mut code = ExitCode::SUCCESS;
-    for line in commands_in(command) {
-        match session.run(line) {
+    for (line, text) in steps {
+        session.line = *line;
+        if line.is_some() {
+            // Echo script commands on stderr, so stdout stays parseable.
+            let _ = io::stdout().flush();
+            eprintln!("> {text}");
+        }
+        match session.run(text) {
             Outcome::Ok => {}
             Outcome::Failed => code = ExitCode::FAILURE,
             Outcome::Exit => break,
@@ -155,7 +180,12 @@ fn interactive(session: &mut Session, prompt: &str) -> ExitCode {
 }
 
 fn main() -> ExitCode {
-    let cfg = match cli::parse(std::env::args().skip(1)) {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("config") {
+        return config::run(&args[1..]);
+    }
+
+    let cfg = match cli::parse(args, config::load) {
         Ok(Action::Run(cfg)) => cfg,
         Ok(Action::Help) => {
             print!("{}", cli::USAGE);
@@ -171,6 +201,35 @@ fn main() -> ExitCode {
         }
     };
 
+    // Commands for headless mode. A script is read and checked before
+    // connecting, so a broken script never touches the device.
+    let steps: Option<Vec<(Option<usize>, String)>> = if let Some(path) = &cfg.script {
+        let text = match script::read(path) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("ERROR: {e}");
+                return ExitCode::from(2);
+            }
+        };
+        match script::parse(&text) {
+            Ok(steps) if steps.is_empty() => {
+                let source = if path == "-" { "stdin".to_string() } else { format!("'{path}'") };
+                eprintln!("ERROR: script {source} contains no commands");
+                return ExitCode::from(2);
+            }
+            Ok(steps) => Some(steps.into_iter().map(|s| (Some(s.line), s.text)).collect()),
+            Err(errors) => {
+                for e in errors {
+                    eprintln!("ERROR: {path}: {e}");
+                }
+                eprintln!("Script not run, nothing was sent to the device.");
+                return ExitCode::from(2);
+            }
+        }
+    } else {
+        cfg.command.as_deref().map(|c| commands_in(c).map(|t| (None, t.to_string())).collect())
+    };
+
     let (transport, prompt) = match open_transport(&cfg) {
         Ok(t) => t,
         Err(e) => {
@@ -178,17 +237,18 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let headless_mode = cfg.command.is_some();
+    let headless_mode = steps.is_some();
     let default_fmt = if headless_mode { OutFmt::Json } else { OutFmt::Columns };
     let mut session = Session {
         client: Client::new(transport, cfg.unit),
         fmt: Format { out: cfg.fmt.unwrap_or(default_fmt), endian: cfg.endian, number: cfg.number, coil: cfg.coil },
         separate: headless_mode,
         printed: 0,
+        line: None,
     };
 
-    match cfg.command.as_deref() {
-        Some(cmd) => headless(&mut session, cmd),
+    match &steps {
+        Some(steps) => headless(&mut session, steps),
         _ => interactive(&mut session, &prompt),
     }
 }
