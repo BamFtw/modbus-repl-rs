@@ -1,6 +1,0 @@
-ri 30000 20
-wait 500
-ri 30020 2
-wait 500
-fmt list
-ri 30000 20
